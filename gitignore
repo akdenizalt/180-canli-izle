@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.env
+.venv/
+videos/
+live/
+*.m3u8
+*.ts
