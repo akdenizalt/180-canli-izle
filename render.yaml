@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: github-release-hls
+    runtime: docker
+    plan: starter
+    healthCheckPath: /healthz
+    envVars:
+      - key: GITHUB_REPOSITORY
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+        optional: true
