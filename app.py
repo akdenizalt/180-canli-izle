@@ -21,7 +21,8 @@ from urllib.parse import unquote
 LOG = logging.getLogger("release-hls")
 
 ROOT = Path(os.getenv("DATA_DIR", "/tmp/release-hls"))
-VIDEO_DIR = ROOT / "videos"
+SOURCE_DIR = ROOT / "source"
+NORMALIZED_DIR = ROOT / "normalized"
 HLS_DIR = ROOT / "live"
 PLAYLIST = HLS_DIR / "index.m3u8"
 
@@ -119,59 +120,166 @@ def get_release_assets() -> list[dict[str, Any]]:
     return ordered
 
 
-def download_assets(assets: list[dict[str, Any]]) -> list[Path]:
-    VIDEO_DIR.mkdir(parents=True, exist_ok=True)
-    paths: list[Path] = []
+def download_asset(asset: dict[str, Any]) -> Path:
+    SOURCE_DIR.mkdir(parents=True, exist_ok=True)
 
-    for asset in assets:
-        if STOPPING.is_set():
-            raise RuntimeError("Kapatma istendi; indirme durduruldu.")
+    name = asset["name"]
+    destination = SOURCE_DIR / name
+    partial = destination.with_suffix(destination.suffix + ".part")
 
-        name = asset["name"]
-        destination = VIDEO_DIR / name
-        partial = destination.with_suffix(destination.suffix + ".part")
+    headers = {
+        "Accept": "application/octet-stream",
+        "User-Agent": "github-release-hls/1.0",
+    }
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
 
-        headers = {
-            "Accept": "application/octet-stream",
-            "User-Agent": "github-release-hls/1.0",
-        }
-        if GITHUB_TOKEN:
-            headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    request = urllib.request.Request(asset["url"], headers=headers)
 
-        request = urllib.request.Request(asset["url"], headers=headers)
+    try:
+        LOG.info("Asset indiriliyor: %s", name)
 
-        try:
-            LOG.info("Asset indiriliyor: %s", name)
-
-            # Videoyu belleğe tamamen almadan, 1 MiB bloklarla diske yaz.
-            with urllib.request.urlopen(request, timeout=120) as response:
-                with partial.open("wb") as output:
-                    shutil.copyfileobj(
-                        response,
-                        output,
-                        length=1024 * 1024,
-                    )
-
-            size = partial.stat().st_size
-            if size == 0:
-                raise RuntimeError("indirilen dosya boş")
-
-            expected_size = asset.get("size")
-            if expected_size is not None and size != expected_size:
-                raise RuntimeError(
-                    f"dosya boyutu eksik: {size}/{expected_size} bayt"
+        # Videoyu RAM'e tamamen almadan, 1 MiB bloklarla diske yaz.
+        with urllib.request.urlopen(request, timeout=120) as response:
+            with partial.open("wb") as output:
+                shutil.copyfileobj(
+                    response,
+                    output,
+                    length=1024 * 1024,
                 )
 
-            partial.replace(destination)
-            paths.append(destination)
-            LOG.info("Asset indirildi: %s (%d bayt)", name, size)
+        size = partial.stat().st_size
+        if size == 0:
+            raise RuntimeError("indirilen dosya boş")
 
-        except Exception as exc:
-            partial.unlink(missing_ok=True)
-            LOG.exception("Asset indirme başarısız: %s: %s", name, exc)
-            raise RuntimeError(f"Asset indirilemedi: {name}") from exc
+        expected_size = asset.get("size")
+        if expected_size is not None and size != expected_size:
+            raise RuntimeError(
+                f"dosya boyutu eksik: {size}/{expected_size} bayt"
+            )
 
-    return paths
+        partial.replace(destination)
+        LOG.info("Asset indirildi: %s (%d bayt)", name, size)
+        return destination
+
+    except Exception as exc:
+        partial.unlink(missing_ok=True)
+        LOG.exception("Asset indirme başarısız: %s: %s", name, exc)
+        raise RuntimeError(f"Asset indirilemedi: {name}") from exc
+
+
+def source_has_audio(source: Path) -> bool:
+    command = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=index",
+        "-of", "csv=p=0",
+        str(source),
+    ]
+
+    result = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return bool(result.stdout.strip())
+
+
+def normalize_asset(source: Path, index: int) -> Path:
+    NORMALIZED_DIR.mkdir(parents=True, exist_ok=True)
+    destination = NORMALIZED_DIR / f"video_{index:04d}.mp4"
+    partial = NORMALIZED_DIR / f"video_{index:04d}.partial.mp4"
+
+    has_audio = source_has_audio(source)
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel", "warning",
+        "-i", str(source),
+    ]
+
+    if not has_audio:
+        # Sessiz videolara da AAC ses akışı ekle; böylece tüm girişlerin
+        # akış yapısı aynı olur.
+        command.extend([
+            "-f", "lavfi",
+            "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+        ])
+
+    command.extend([
+        "-map", "0:v:0",
+    ])
+
+    if has_audio:
+        command.extend([
+            "-map", "0:a:0",
+            "-af", "aresample=48000,apad",
+        ])
+    else:
+        command.extend([
+            "-map", "1:a:0",
+        ])
+
+    command.extend([
+        "-vf",
+        (
+            "scale=640:360:force_original_aspect_ratio=decrease,"
+            "pad=640:360:(ow-iw)/2:(oh-ih)/2,"
+            "fps=20,format=yuv420p"
+        ),
+        "-r", "20",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+        "-g", "80",
+        "-keyint_min", "80",
+        "-sc_threshold", "0",
+        "-force_key_frames", "expr:gte(t,n_forced*4)",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ar", "48000",
+        "-ac", "2",
+        "-shortest",
+        "-video_track_timescale", "90000",
+        "-movflags", "+faststart",
+        str(partial),
+    ])
+
+    LOG.info("Video standart biçime dönüştürülüyor: %s", source.name)
+
+    try:
+        subprocess.run(command, check=True)
+        if not partial.is_file() or partial.stat().st_size == 0:
+            raise RuntimeError("dönüştürülmüş video boş oluştu")
+
+        partial.replace(destination)
+        LOG.info("Video hazır: %s", destination.name)
+
+        # Ham dosyayı silerek geçici disk kullanımını azalt.
+        source.unlink(missing_ok=True)
+        return destination
+
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
+
+
+def prepare_videos(assets: list[dict[str, Any]]) -> list[Path]:
+    normalized: list[Path] = []
+
+    for index, asset in enumerate(assets, start=1):
+        if STOPPING.is_set():
+            raise RuntimeError("Kapatma istendi; video hazırlama durduruldu.")
+
+        source = download_asset(asset)
+        normalized_path = normalize_asset(source, index)
+        normalized.append(normalized_path)
+
+    return normalized
 
 
 def create_concat_file(video_paths: list[Path]) -> Path:
@@ -203,32 +311,9 @@ def start_ffmpeg(video_paths: list[Path]) -> subprocess.Popen[bytes]:
         "-f", "concat",
         "-safe", "0",
         "-i", str(concat_file),
-
         "-map", "0:v:0",
-        "-map", "0:a:0?",
-
-        "-vf",
-        (
-            "scale=640:360:force_original_aspect_ratio=decrease,"
-            "pad=640:360:(ow-iw)/2:(oh-ih)/2,"
-            "fps=20"
-        ),
-
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-tune", "zerolatency",
-        "-pix_fmt", "yuv420p",
-        "-r", "20",
-        "-g", "80",
-        "-keyint_min", "80",
-        "-sc_threshold", "0",
-        "-force_key_frames", "expr:gte(t,n_forced*4)",
-
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-ar", "48000",
-        "-ac", "2",
-
+        "-map", "0:a:0",
+        "-c", "copy",
         "-f", "hls",
         "-hls_time", "4",
         "-hls_list_size", "6",
@@ -243,8 +328,35 @@ def start_ffmpeg(video_paths: list[Path]) -> subprocess.Popen[bytes]:
         str(PLAYLIST),
     ]
 
-    LOG.info("FFmpeg başlatılıyor; %d video sıraya alındı.", len(video_paths))
+    LOG.info("FFmpeg HLS yayını başlatılıyor.")
     return subprocess.Popen(command)
+
+
+def start_streaming() -> None:
+    global FFMPEG, START_ERROR
+
+    try:
+        LOG.info("GitHub Release asset'leri alınıyor.")
+        assets = get_release_assets()
+        LOG.info("%d asset bulundu.", len(assets))
+
+        video_paths = prepare_videos(assets)
+        if STOPPING.is_set():
+            return
+
+        FFMPEG = start_ffmpeg(video_paths)
+        return_code = FFMPEG.wait()
+
+        if not STOPPING.is_set():
+            START_ERROR = (
+                "FFmpeg beklenmedik şekilde kapandı "
+                f"(çıkış kodu {return_code})"
+            )
+            LOG.error(START_ERROR)
+
+    except Exception as exc:
+        START_ERROR = str(exc)
+        LOG.exception("Yayın başlatılamadı: %s", exc)
 
 
 class HLSRequestHandler(BaseHTTPRequestHandler):
@@ -286,14 +398,12 @@ class HLSRequestHandler(BaseHTTPRequestHandler):
             and playlist_ready
         )
 
-        body = json.dumps(
-            {
-                "status": "ok" if healthy else "unhealthy",
-                "ffmpeg_running": ffmpeg_running,
-                "playlist_ready": playlist_ready,
-                "error": START_ERROR,
-            }
-        ).encode("utf-8")
+        body = json.dumps({
+            "status": "ok" if healthy else "unhealthy",
+            "ffmpeg_running": ffmpeg_running,
+            "playlist_ready": playlist_ready,
+            "error": START_ERROR,
+        }).encode("utf-8")
 
         self.send_response(200 if healthy else 503)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -328,7 +438,7 @@ class HLSRequestHandler(BaseHTTPRequestHandler):
 <body>
   <h1>Canlı Yayın</h1>
   <video id="video" controls playsinline></video>
-  <p id="status">Yayın yükleniyor…</p>
+  <p id="status">Yayın yükleniyor...</p>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
   <script>
     const video = document.getElementById("video");
@@ -392,7 +502,6 @@ class HLSRequestHandler(BaseHTTPRequestHandler):
             content_type = "application/octet-stream"
 
         size = requested_file.stat().st_size
-
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -412,34 +521,14 @@ class HLSRequestHandler(BaseHTTPRequestHandler):
         LOG.info("HTTP %s - %s", self.address_string(), fmt % args)
 
 
-def start_streaming() -> None:
-    global FFMPEG, START_ERROR
-
-    try:
-        LOG.info("GitHub Release asset'leri alınıyor.")
-        assets = get_release_assets()
-        LOG.info("%d asset bulundu.", len(assets))
-
-        video_paths = download_assets(assets)
-        if STOPPING.is_set():
-            return
-
-        FFMPEG = start_ffmpeg(video_paths)
-        return_code = FFMPEG.wait()
-
-        if not STOPPING.is_set():
-            START_ERROR = (
-                "FFmpeg beklenmedik şekilde kapandı "
-                f"(çıkış kodu {return_code})"
-            )
-            LOG.error(START_ERROR)
-
-    except Exception as exc:
-        START_ERROR = str(exc)
-        LOG.exception("Yayın başlatılamadı: %s", exc)
-
-
 def main() -> int:
+    global START_ERROR
+
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
     port = int(os.getenv("PORT", "10000"))
     server = ThreadingHTTPServer(
         ("0.0.0.0", port),
@@ -447,10 +536,6 @@ def main() -> int:
     )
     server.daemon_threads = True
 
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
     LOG.info("HTTP sunucusu %d portunda dinliyor.", port)
 
     def shutdown(_signum: int, _frame: object) -> None:
