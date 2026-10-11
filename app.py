@@ -9,7 +9,6 @@ import re
 import shutil
 import signal
 import subprocess
-import sys
 import threading
 import urllib.error
 import urllib.request
@@ -32,7 +31,6 @@ FIXED_ASSETS = [
     "reklam2.mp4",
     "jenerik.mp4",
 ]
-
 PROGRAM_RE = re.compile(r"^program(\d+)\.mp4$", re.IGNORECASE)
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
@@ -57,12 +55,12 @@ def github_headers(accept: str = "application/vnd.github+json") -> dict[str, str
 def get_release_assets() -> list[dict[str, Any]]:
     if not re.fullmatch(r"[^/\s]+/[^/\s]+", GITHUB_REPOSITORY):
         raise RuntimeError(
-            "GITHUB_REPOSITORY ayarı 'sahip/repo' biçiminde olmalı."
+            "GITHUB_REPOSITORY 'sahip/repo' biçiminde ayarlanmalı."
         )
 
     url = (
-        "https://api.github.com/repos/"
-        f"{GITHUB_REPOSITORY}/releases/latest"
+        f"https://api.github.com/repos/{GITHUB_REPOSITORY}"
+        "/releases/latest"
     )
     request = urllib.request.Request(url, headers=github_headers())
 
@@ -72,7 +70,7 @@ def get_release_assets() -> list[dict[str, Any]]:
     except urllib.error.HTTPError as exc:
         if exc.code == 403:
             raise RuntimeError(
-                "GitHub API 403 verdi. API rate limit dolmuş olabilir. "
+                "GitHub API 403 verdi. İstek sınırı dolmuş olabilir. "
                 "Render'daki GITHUB_TOKEN değerini kontrol et."
             ) from exc
         raise RuntimeError(
@@ -96,13 +94,13 @@ def get_release_assets() -> list[dict[str, Any]]:
             programs.append((int(match.group(1)), asset))
 
     programs.sort(key=lambda item: item[0])
-    program_numbers = [number for number, _ in programs]
-    expected_numbers = list(range(1, len(program_numbers) + 1))
+    numbers = [number for number, _asset in programs]
+    expected = list(range(1, len(numbers) + 1))
 
-    if program_numbers != expected_numbers:
+    if numbers != expected:
         raise RuntimeError(
-            "programN.mp4 dosyaları program1.mp4'ten başlayıp "
-            f"kesintisiz artmalı. Bulunan numaralar: {program_numbers or 'yok'}"
+            "Program numaraları program1.mp4'ten başlayıp kesintisiz "
+            f"artmalı. Bulunan numaralar: {numbers or 'yok'}"
         )
 
     if not programs:
@@ -110,23 +108,26 @@ def get_release_assets() -> list[dict[str, Any]]:
 
     if missing:
         raise RuntimeError(
-            "GitHub Release'te gerekli asset'ler eksik: "
+            "GitHub Release'te gerekli dosyalar eksik: "
             + ", ".join(missing)
         )
 
-    ordered_assets = [assets_by_name[name] for name in FIXED_ASSETS]
-    ordered_assets.extend(asset for _, asset in programs)
-    return ordered_assets
+    ordered = [assets_by_name[name] for name in FIXED_ASSETS]
+    ordered.extend(asset for _number, asset in programs)
+    return ordered
 
 
 def download_assets(assets: list[dict[str, Any]]) -> list[Path]:
     VIDEO_DIR.mkdir(parents=True, exist_ok=True)
-    downloaded_paths: list[Path] = []
+    paths: list[Path] = []
 
     for asset in assets:
+        if STOPPING.is_set():
+            raise RuntimeError("Kapatma istendi; indirme durduruldu.")
+
         name = asset["name"]
         destination = VIDEO_DIR / name
-        partial_path = destination.with_suffix(destination.suffix + ".part")
+        partial = destination.with_suffix(destination.suffix + ".part")
 
         headers = {
             "Accept": "application/octet-stream",
@@ -142,175 +143,182 @@ def download_assets(assets: list[dict[str, Any]]) -> list[Path]:
 
             # Videoyu belleğe tamamen almadan, 1 MiB bloklarla diske yaz.
             with urllib.request.urlopen(request, timeout=120) as response:
-                with partial_path.open("wb") as output:
+                with partial.open("wb") as output:
                     shutil.copyfileobj(
                         response,
                         output,
                         length=1024 * 1024,
                     )
 
-            actual_size = partial_path.stat().st_size
-            if actual_size == 0:
+            size = partial.stat().st_size
+            if size == 0:
                 raise RuntimeError("indirilen dosya boş")
 
             expected_size = asset.get("size")
-            if expected_size is not None and actual_size != expected_size:
+            if expected_size is not None and size != expected_size:
                 raise RuntimeError(
-                    "indirilen dosyanın boyutu beklenenden farklı: "
-                    f"{actual_size}/{expected_size} bayt"
+                    f"dosya boyutu eksik: {size}/{expected_size} bayt"
                 )
 
-            partial_path.replace(destination)
-            downloaded_paths.append(destination)
-
-            LOG.info(
-                "Asset indirildi: %s (%d bayt)",
-                name,
-                actual_size,
-            )
+            partial.replace(destination)
+            paths.append(destination)
+            LOG.info("Asset indirildi: %s (%d bayt)", name, size)
 
         except Exception as exc:
-            partial_path.unlink(missing_ok=True)
+            partial.unlink(missing_ok=True)
             LOG.exception("Asset indirme başarısız: %s: %s", name, exc)
             raise RuntimeError(f"Asset indirilemedi: {name}") from exc
 
-    return downloaded_paths
+    return paths
 
 
 def create_concat_file(video_paths: list[Path]) -> Path:
     ROOT.mkdir(parents=True, exist_ok=True)
-    concat_path = ROOT / "inputs.txt"
+    concat_file = ROOT / "inputs.txt"
 
     def quote_path(path: Path) -> str:
-        escaped = str(path.resolve()).replace("\\", "/")
-        escaped = escaped.replace("'", "'\\''")
-        return escaped
+        value = str(path.resolve()).replace("\\", "/")
+        return value.replace("'", "'\\''")
 
     contents = "".join(
         f"file '{quote_path(path)}'\n"
         for path in video_paths
     )
-    concat_path.write_text(contents, encoding="utf-8")
-    return concat_path
+    concat_file.write_text(contents, encoding="utf-8")
+    return concat_file
 
 
 def start_ffmpeg(video_paths: list[Path]) -> subprocess.Popen[bytes]:
     HLS_DIR.mkdir(parents=True, exist_ok=True)
-    concat_path = create_concat_file(video_paths)
+    concat_file = create_concat_file(video_paths)
 
     command = [
         "ffmpeg",
         "-hide_banner",
-        "-loglevel",
-        "info",
+        "-loglevel", "info",
         "-re",
-        "-stream_loop",
-        "-1",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(concat_path),
+        "-stream_loop", "-1",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", str(concat_file),
+
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
+
         "-vf",
         (
             "scale=640:360:force_original_aspect_ratio=decrease,"
             "pad=640:360:(ow-iw)/2:(oh-ih)/2,"
             "fps=20"
         ),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-pix_fmt",
-        "yuv420p",
-        "-r",
-        "20",
-        "-g",
-        "80",
-        "-keyint_min",
-        "80",
-        "-sc_threshold",
-        "0",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-ar",
-        "48000",
-        "-ac",
-        "2",
-        "-f",
-        "hls",
-        "-hls_time",
-        "4",
-        "-hls_list_size",
-        "6",
-        "-hls_delete_threshold",
-        "2",
+
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+        "-pix_fmt", "yuv420p",
+        "-r", "20",
+        "-g", "80",
+        "-keyint_min", "80",
+        "-sc_threshold", "0",
+        "-force_key_frames", "expr:gte(t,n_forced*4)",
+
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ar", "48000",
+        "-ac", "2",
+
+        "-f", "hls",
+        "-hls_time", "4",
+        "-hls_list_size", "6",
+        "-hls_delete_threshold", "2",
         "-hls_flags",
-        "delete_segments+append_list+independent_segments+omit_endlist",
+        (
+            "delete_segments+append_list+independent_segments+"
+            "omit_endlist+temp_file"
+        ),
         "-hls_segment_filename",
         str(HLS_DIR / "segment_%06d.ts"),
         str(PLAYLIST),
     ]
 
-    LOG.info("FFmpeg başlatılıyor.")
-    LOG.info("Girdi video sayısı: %d", len(video_paths))
-
+    LOG.info("FFmpeg başlatılıyor; %d video sıraya alındı.", len(video_paths))
     return subprocess.Popen(command)
 
 
+def start_streaming() -> None:
+    global FFMPEG, START_ERROR
+
+    try:
+        LOG.info("GitHub Release asset'leri alınıyor.")
+        assets = get_release_assets()
+        LOG.info("%d asset bulundu.", len(assets))
+
+        paths = download_assets(assets)
+        if STOPPING.is_set():
+            return
+
+        FFMPEG = start_ffmpeg(paths)
+
+        return_code = FFMPEG.wait()
+        if not STOPPING.is_set():
+            START_ERROR = (
+                "FFmpeg beklenmedik şekilde kapandı "
+                f"(çıkış kodu {return_code})"
+            )
+            LOG.error(START_ERROR)
+
+    except Exception as exc:
+        START_ERROR = str(exc)
+        LOG.exception("Yayın başlatılamadı: %s", exc)
+
+
 class HLSRequestHandler(BaseHTTPRequestHandler):
-    def do_HEAD(self) -> None:
-        """Render ve istemcilerin HEAD sağlık kontrollerini destekle."""
-        self._handle_request(send_body=False)
-
     def do_GET(self) -> None:
-        self._handle_request(send_body=True)
+        self.handle_request(send_body=True)
 
-    def _handle_request(self, send_body: bool) -> None:
+    def do_HEAD(self) -> None:
+        self.handle_request(send_body=False)
+
+    def handle_request(self, send_body: bool) -> None:
         path = unquote(self.path.split("?", 1)[0])
 
         if path == "/healthz":
-            self._send_health(send_body)
+            self.send_health(send_body)
             return
 
         if path == "/":
-            body = (
-                b"GitHub Release HLS service. "
-                b"Playlist: /live/index.m3u8\n"
-            )
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            if send_body:
-                self.wfile.write(body)
+            self.send_player(send_body)
             return
 
-        if path == "/live" or path == "/live/":
+        if path in ("/live", "/live/"):
             self.send_response(302)
             self.send_header("Location", "/live/index.m3u8")
             self.end_headers()
             return
 
         if path.startswith("/live/"):
-            self._send_live_file(path, send_body)
+            self.send_live_file(path, send_body)
             return
 
         self.send_error(404, "Not Found")
 
-    def _send_health(self, send_body: bool) -> None:
+    def send_health(self, send_body: bool) -> None:
         ffmpeg_running = FFMPEG is not None and FFMPEG.poll() is None
-        healthy = START_ERROR is None and ffmpeg_running
+        playlist_ready = PLAYLIST.is_file() and PLAYLIST.stat().st_size > 0
+        healthy = (
+            START_ERROR is None
+            and ffmpeg_running
+            and playlist_ready
+        )
 
-        response = {
-            "status": "ok" if healthy else "unhealthy",
-            "ffmpeg_running": ffmpeg_running,
-            "error": START_ERROR,
-        }
-        body = json.dumps(response).encode("utf-8")
+        body = json.dumps(
+            {
+                "status": "ok" if healthy else "unhealthy",
+                "ffmpeg_running": ffmpeg_running,
+                "playlist_ready": playlist_ready,
+                "error": START_ERROR,
+            }
+        ).encode("utf-8")
 
         self.send_response(200 if healthy else 503)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -321,12 +329,79 @@ class HLSRequestHandler(BaseHTTPRequestHandler):
         if send_body:
             self.wfile.write(body)
 
-    def _send_live_file(self, url_path: str, send_body: bool) -> None:
-        relative_path = url_path[len("/live/"):]
-        requested_file = (HLS_DIR / relative_path).resolve()
-        live_root = HLS_DIR.resolve()
+    def send_player(self, send_body: bool) -> None:
+        body = b"""<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Canlı Yayın</title>
+  <style>
+    body {
+      margin: 24px;
+      background: #111;
+      color: #eee;
+      font: 16px sans-serif;
+      text-align: center;
+    }
+    video {
+      width: min(100%, 960px);
+      background: #000;
+    }
+  </style>
+</head>
+<body>
+  <h1>Canlı Yayın</h1>
+  <video id="video" controls playsinline></video>
+  <p id="status">Yayın yükleniyor…</p>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <script>
+    const video = document.getElementById("video");
+    const status = document.getElementById("status");
+    const streamUrl = "/live/index.m3u8";
 
-        if requested_file != live_root and live_root not in requested_file.parents:
+    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = streamUrl;
+      status.textContent = "Oynatmak için videoya bas.";
+    } else if (window.Hls && Hls.isSupported()) {
+      const hls = new Hls();
+      hls.loadSource(streamUrl);
+      hls.attachMedia(video);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        status.textContent = "Oynatmak için videoya bas.";
+      });
+
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (data.fatal) {
+          status.textContent =
+            "Yayın açılamadı. /healthz adresini kontrol et.";
+        }
+      });
+    } else {
+      status.textContent = "Bu tarayıcı HLS oynatmayı desteklemiyor.";
+    }
+  </script>
+</body>
+</html>"""
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+
+        if send_body:
+            self.wfile.write(body)
+
+    def send_live_file(self, url_path: str, send_body: bool) -> None:
+        relative_path = url_path[len("/live/"):]
+        live_root = HLS_DIR.resolve()
+        requested_file = (HLS_DIR / relative_path).resolve()
+
+        if (
+            requested_file != live_root
+            and live_root not in requested_file.parents
+        ):
             self.send_error(404, "Not Found")
             return
 
@@ -341,41 +416,30 @@ class HLSRequestHandler(BaseHTTPRequestHandler):
         else:
             content_type = "application/octet-stream"
 
-        body = requested_file.read_bytes()
+        size = requested_file.stat().st_size
 
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(size))
         self.end_headers()
 
         if send_body:
-            self.wfile.write(body)
+            with requested_file.open("rb") as source:
+                shutil.copyfileobj(source, self.wfile, length=64 * 1024)
 
     def log_message(self, fmt: str, *args: object) -> None:
         LOG.info("HTTP %s - %s", self.address_string(), fmt % args)
 
 
 def main() -> int:
-    global FFMPEG, START_ERROR
+    global START_ERROR
 
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(message)s",
     )
-
-    try:
-        LOG.info("GitHub Release asset'leri alınıyor.")
-        assets = get_release_assets()
-        LOG.info("Release asset sayısı: %d", len(assets))
-
-        video_paths = download_assets(assets)
-        FFMPEG = start_ffmpeg(video_paths)
-
-    except Exception as exc:
-        START_ERROR = str(exc)
-        LOG.exception("Yayın başlatılamadı: %s", exc)
 
     port = int(os.getenv("PORT", "10000"))
     server = ThreadingHTTPServer(("0.0.0.0", port), HLSRequestHandler)
@@ -383,36 +447,27 @@ def main() -> int:
 
     LOG.info("HTTP sunucusu %d portunda dinliyor.", port)
 
-    def handle_shutdown(_signum: int, _frame: object) -> None:
+    def shutdown(_signum: int, _frame: object) -> None:
         STOPPING.set()
         threading.Thread(
             target=server.shutdown,
             daemon=True,
         ).start()
 
-    signal.signal(signal.SIGTERM, handle_shutdown)
-    signal.signal(signal.SIGINT, handle_shutdown)
+        if FFMPEG is not None and FFMPEG.poll() is None:
+            FFMPEG.terminate()
 
-    if FFMPEG is not None:
-        def monitor_ffmpeg() -> None:
-            global START_ERROR
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
 
-            return_code = FFMPEG.wait()
-            if not STOPPING.is_set():
-                START_ERROR = (
-                    "FFmpeg beklenmedik şekilde kapandı "
-                    f"(çıkış kodu {return_code})"
-                )
-                LOG.error(START_ERROR)
-
-        threading.Thread(
-            target=monitor_ffmpeg,
-            daemon=True,
-        ).start()
+    streamer = threading.Thread(target=start_streaming, daemon=True)
+    streamer.start()
 
     try:
         server.serve_forever(poll_interval=0.5)
     finally:
+        STOPPING.set()
+
         if FFMPEG is not None and FFMPEG.poll() is None:
             FFMPEG.terminate()
             try:
@@ -426,4 +481,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
