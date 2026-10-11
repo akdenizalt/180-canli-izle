@@ -10,6 +10,7 @@ import shutil
 import signal
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -58,7 +59,7 @@ def github_headers(
 def get_release_assets() -> list[dict[str, Any]]:
     if not re.fullmatch(r"[^/\s]+/[^/\s]+", GITHUB_REPOSITORY):
         raise RuntimeError(
-            "GITHUB_REPOSITORY 'sahip/repo' biçiminde ayarlanmalı."
+            "GITHUB_REPOSITORY must be in owner/repository format."
         )
 
     url = (
@@ -73,14 +74,14 @@ def get_release_assets() -> list[dict[str, Any]]:
     except urllib.error.HTTPError as exc:
         if exc.code == 403:
             raise RuntimeError(
-                "GitHub API 403 verdi. İstek sınırı dolmuş olabilir. "
-                "Render'daki GITHUB_TOKEN değerini kontrol et."
+                "GitHub API returned 403. Check API rate limit and "
+                "the GITHUB_TOKEN setting."
             ) from exc
         raise RuntimeError(
-            f"GitHub Releases API hatası ({exc.code}): {exc.reason}"
+            f"GitHub Releases API error ({exc.code}): {exc.reason}"
         ) from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"GitHub API'ye ulaşılamadı: {exc}") from exc
+        raise RuntimeError(f"Could not reach GitHub API: {exc}") from exc
 
     assets = release.get("assets", [])
     assets_by_name = {asset.get("name"): asset for asset in assets}
@@ -102,16 +103,16 @@ def get_release_assets() -> list[dict[str, Any]]:
 
     if numbers != expected:
         raise RuntimeError(
-            "Program numaraları program1.mp4'ten başlayıp kesintisiz "
-            f"artmalı. Bulunan numaralar: {numbers or 'yok'}"
+            "Program videos must be numbered continuously from program1.mp4. "
+            f"Found: {numbers or 'none'}"
         )
 
     if not programs:
-        missing.append("program1.mp4 (en az bir program videosu gerekli)")
+        missing.append("program1.mp4 (at least one program video is required)")
 
     if missing:
         raise RuntimeError(
-            "GitHub Release'te gerekli dosyalar eksik: "
+            "Required assets are missing from the GitHub Release: "
             + ", ".join(missing)
         )
 
@@ -137,9 +138,10 @@ def download_asset(asset: dict[str, Any]) -> Path:
     request = urllib.request.Request(asset["url"], headers=headers)
 
     try:
-        LOG.info("Asset indiriliyor: %s", name)
+        LOG.info("Downloading asset: %s", name)
 
-        # Videoyu RAM'e tamamen almadan, 1 MiB bloklarla diske yaz.
+        # Write bounded chunks to disk instead of loading the whole video
+        # into memory.
         with urllib.request.urlopen(request, timeout=120) as response:
             with partial.open("wb") as output:
                 shutil.copyfileobj(
@@ -150,22 +152,22 @@ def download_asset(asset: dict[str, Any]) -> Path:
 
         size = partial.stat().st_size
         if size == 0:
-            raise RuntimeError("indirilen dosya boş")
+            raise RuntimeError("Downloaded file is empty.")
 
         expected_size = asset.get("size")
         if expected_size is not None and size != expected_size:
             raise RuntimeError(
-                f"dosya boyutu eksik: {size}/{expected_size} bayt"
+                f"Downloaded size mismatch: {size}/{expected_size} bytes."
             )
 
         partial.replace(destination)
-        LOG.info("Asset indirildi: %s (%d bayt)", name, size)
+        LOG.info("Asset downloaded: %s (%d bytes)", name, size)
         return destination
 
     except Exception as exc:
         partial.unlink(missing_ok=True)
-        LOG.exception("Asset indirme başarısız: %s: %s", name, exc)
-        raise RuntimeError(f"Asset indirilemedi: {name}") from exc
+        LOG.exception("Asset download failed: %s: %s", name, exc)
+        raise RuntimeError(f"Could not download asset: {name}") from exc
 
 
 def source_has_audio(source: Path) -> bool:
@@ -189,9 +191,9 @@ def source_has_audio(source: Path) -> bool:
 
 def normalize_asset(source: Path, index: int) -> Path:
     NORMALIZED_DIR.mkdir(parents=True, exist_ok=True)
+
     destination = NORMALIZED_DIR / f"video_{index:04d}.mp4"
     partial = NORMALIZED_DIR / f"video_{index:04d}.partial.mp4"
-
     has_audio = source_has_audio(source)
 
     command = [
@@ -203,8 +205,7 @@ def normalize_asset(source: Path, index: int) -> Path:
     ]
 
     if not has_audio:
-        # Sessiz videolara da AAC ses akışı ekle; böylece tüm girişlerin
-        # akış yapısı aynı olur.
+        # Add silent AAC so every normalized file has the same streams.
         command.extend([
             "-f", "lavfi",
             "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
@@ -249,17 +250,18 @@ def normalize_asset(source: Path, index: int) -> Path:
         str(partial),
     ])
 
-    LOG.info("Video standart biçime dönüştürülüyor: %s", source.name)
+    LOG.info("Normalizing video: %s", source.name)
 
     try:
         subprocess.run(command, check=True)
+
         if not partial.is_file() or partial.stat().st_size == 0:
-            raise RuntimeError("dönüştürülmüş video boş oluştu")
+            raise RuntimeError("Normalized video is empty.")
 
         partial.replace(destination)
-        LOG.info("Video hazır: %s", destination.name)
+        LOG.info("Video ready: %s", destination.name)
 
-        # Ham dosyayı silerek geçici disk kullanımını azalt.
+        # Remove the source after successful normalization to save disk space.
         source.unlink(missing_ok=True)
         return destination
 
@@ -273,7 +275,7 @@ def prepare_videos(assets: list[dict[str, Any]]) -> list[Path]:
 
     for index, asset in enumerate(assets, start=1):
         if STOPPING.is_set():
-            raise RuntimeError("Kapatma istendi; video hazırlama durduruldu.")
+            raise RuntimeError("Shutdown requested during video preparation.")
 
         source = download_asset(asset)
         normalized_path = normalize_asset(source, index)
@@ -328,7 +330,7 @@ def start_ffmpeg(video_paths: list[Path]) -> subprocess.Popen[bytes]:
         str(PLAYLIST),
     ]
 
-    LOG.info("FFmpeg HLS yayını başlatılıyor.")
+    LOG.info("Starting FFmpeg HLS output.")
     return subprocess.Popen(command)
 
 
@@ -336,9 +338,9 @@ def start_streaming() -> None:
     global FFMPEG, START_ERROR
 
     try:
-        LOG.info("GitHub Release asset'leri alınıyor.")
+        LOG.info("Fetching GitHub Release assets.")
         assets = get_release_assets()
-        LOG.info("%d asset bulundu.", len(assets))
+        LOG.info("Found %d assets.", len(assets))
 
         video_paths = prepare_videos(assets)
         if STOPPING.is_set():
@@ -349,14 +351,14 @@ def start_streaming() -> None:
 
         if not STOPPING.is_set():
             START_ERROR = (
-                "FFmpeg beklenmedik şekilde kapandı "
-                f"(çıkış kodu {return_code})"
+                "FFmpeg exited unexpectedly "
+                f"(exit code {return_code})."
             )
             LOG.error(START_ERROR)
 
     except Exception as exc:
         START_ERROR = str(exc)
-        LOG.exception("Yayın başlatılamadı: %s", exc)
+        LOG.exception("Could not start stream: %s", exc)
 
 
 class HLSRequestHandler(BaseHTTPRequestHandler):
@@ -420,7 +422,7 @@ class HLSRequestHandler(BaseHTTPRequestHandler):
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Canlı Yayın</title>
+  <title>Canli Yayin</title>
   <style>
     body {
       margin: 24px;
@@ -436,36 +438,69 @@ class HLSRequestHandler(BaseHTTPRequestHandler):
   </style>
 </head>
 <body>
-  <h1>Canlı Yayın</h1>
+  <h1>Canli Yayin</h1>
   <video id="video" controls playsinline></video>
-  <p id="status">Yayın yükleniyor...</p>
+  <p id="status">Yayin hazirlaniyor...</p>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
   <script>
     const video = document.getElementById("video");
     const status = document.getElementById("status");
     const streamUrl = "/live/index.m3u8";
 
-    if (video.canPlayType("application/vnd.apple.mpegurl")) {
-      video.src = streamUrl;
-      status.textContent = "Oynatmak için videoya bas.";
-    } else if (window.Hls && Hls.isSupported()) {
-      const hls = new Hls();
-      hls.loadSource(streamUrl);
-      hls.attachMedia(video);
+    function startPlayer() {
+      if (video.canPlayType("application/vnd.apple.mpegurl")) {
+        video.src = streamUrl;
+        status.textContent = "Press play to start.";
+        return;
+      }
 
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        status.textContent = "Oynatmak için videoya bas.";
-      });
+      if (window.Hls && Hls.isSupported()) {
+        const hls = new Hls();
+        hls.loadSource(streamUrl);
+        hls.attachMedia(video);
 
-      hls.on(Hls.Events.ERROR, (_event, data) => {
-        if (data.fatal) {
-          status.textContent =
-            "Yayın açılamadı. /healthz adresini kontrol et.";
-        }
-      });
-    } else {
-      status.textContent = "Bu tarayıcı HLS oynatmayı desteklemiyor.";
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          status.textContent = "Press play to start.";
+        });
+
+        hls.on(Hls.Events.ERROR, (_event, data) => {
+          if (data.fatal) {
+            status.textContent =
+              "Playback error. Check the Render service logs.";
+          }
+        });
+        return;
+      }
+
+      status.textContent = "This browser does not support HLS playback.";
     }
+
+    async function waitForStream() {
+      while (true) {
+        try {
+          const response = await fetch("/healthz", { cache: "no-store" });
+          const state = await response.json();
+
+          if (state.error) {
+            status.textContent = "Stream error: " + state.error;
+            return;
+          }
+
+          if (state.ffmpeg_running && state.playlist_ready) {
+            startPlayer();
+            return;
+          }
+
+          status.textContent = "Videos are being prepared...";
+        } catch (_error) {
+          status.textContent = "Waiting for the stream service...";
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
+    }
+
+    waitForStream();
   </script>
 </body>
 </html>""".encode("utf-8")
@@ -491,7 +526,20 @@ class HLSRequestHandler(BaseHTTPRequestHandler):
             return
 
         if not requested_file.is_file():
-            self.send_error(404, "HLS dosyası henüz hazır değil")
+            if requested_file == PLAYLIST.resolve():
+                # The playlist is created after videos have been prepared and
+                # FFmpeg has written the first HLS output.
+                body = b"HLS playlist is being prepared.\n"
+                self.send_response(503)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Retry-After", "3")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(body)
+            else:
+                self.send_error(404, "HLS segment not found")
             return
 
         if requested_file.suffix == ".m3u8":
@@ -536,7 +584,7 @@ def main() -> int:
     )
     server.daemon_threads = True
 
-    LOG.info("HTTP sunucusu %d portunda dinliyor.", port)
+    LOG.info("HTTP server listening on port %d.", port)
 
     def shutdown(_signum: int, _frame: object) -> None:
         STOPPING.set()
