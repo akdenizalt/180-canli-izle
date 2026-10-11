@@ -41,7 +41,9 @@ START_ERROR: str | None = None
 STOPPING = threading.Event()
 
 
-def github_headers(accept: str = "application/vnd.github+json") -> dict[str, str]:
+def github_headers(
+    accept: str = "application/vnd.github+json",
+) -> dict[str, str]:
     headers = {
         "Accept": accept,
         "User-Agent": "github-release-hls/1.0",
@@ -245,33 +247,6 @@ def start_ffmpeg(video_paths: list[Path]) -> subprocess.Popen[bytes]:
     return subprocess.Popen(command)
 
 
-def start_streaming() -> None:
-    global FFMPEG, START_ERROR
-
-    try:
-        LOG.info("GitHub Release asset'leri alınıyor.")
-        assets = get_release_assets()
-        LOG.info("%d asset bulundu.", len(assets))
-
-        paths = download_assets(assets)
-        if STOPPING.is_set():
-            return
-
-        FFMPEG = start_ffmpeg(paths)
-
-        return_code = FFMPEG.wait()
-        if not STOPPING.is_set():
-            START_ERROR = (
-                "FFmpeg beklenmedik şekilde kapandı "
-                f"(çıkış kodu {return_code})"
-            )
-            LOG.error(START_ERROR)
-
-    except Exception as exc:
-        START_ERROR = str(exc)
-        LOG.exception("Yayın başlatılamadı: %s", exc)
-
-
 class HLSRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self.handle_request(send_body=True)
@@ -330,7 +305,7 @@ class HLSRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def send_player(self, send_body: bool) -> None:
-        body = b"""<!doctype html>
+        body = """<!doctype html>
 <html lang="tr">
 <head>
   <meta charset="utf-8">
@@ -383,7 +358,7 @@ class HLSRequestHandler(BaseHTTPRequestHandler):
     }
   </script>
 </body>
-</html>"""
+</html>""".encode("utf-8")
 
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -427,24 +402,55 @@ class HLSRequestHandler(BaseHTTPRequestHandler):
 
         if send_body:
             with requested_file.open("rb") as source:
-                shutil.copyfileobj(source, self.wfile, length=64 * 1024)
+                shutil.copyfileobj(
+                    source,
+                    self.wfile,
+                    length=64 * 1024,
+                )
 
     def log_message(self, fmt: str, *args: object) -> None:
         LOG.info("HTTP %s - %s", self.address_string(), fmt % args)
 
 
+def start_streaming() -> None:
+    global FFMPEG, START_ERROR
+
+    try:
+        LOG.info("GitHub Release asset'leri alınıyor.")
+        assets = get_release_assets()
+        LOG.info("%d asset bulundu.", len(assets))
+
+        video_paths = download_assets(assets)
+        if STOPPING.is_set():
+            return
+
+        FFMPEG = start_ffmpeg(video_paths)
+        return_code = FFMPEG.wait()
+
+        if not STOPPING.is_set():
+            START_ERROR = (
+                "FFmpeg beklenmedik şekilde kapandı "
+                f"(çıkış kodu {return_code})"
+            )
+            LOG.error(START_ERROR)
+
+    except Exception as exc:
+        START_ERROR = str(exc)
+        LOG.exception("Yayın başlatılamadı: %s", exc)
+
+
 def main() -> int:
-    global START_ERROR
+    port = int(os.getenv("PORT", "10000"))
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", port),
+        HLSRequestHandler,
+    )
+    server.daemon_threads = True
 
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(message)s",
     )
-
-    port = int(os.getenv("PORT", "10000"))
-    server = ThreadingHTTPServer(("0.0.0.0", port), HLSRequestHandler)
-    server.daemon_threads = True
-
     LOG.info("HTTP sunucusu %d portunda dinliyor.", port)
 
     def shutdown(_signum: int, _frame: object) -> None:
@@ -460,7 +466,10 @@ def main() -> int:
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
-    streamer = threading.Thread(target=start_streaming, daemon=True)
+    streamer = threading.Thread(
+        target=start_streaming,
+        daemon=True,
+    )
     streamer.start()
 
     try:
